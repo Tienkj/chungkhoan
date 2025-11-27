@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Giả Lập Thị Trường Chứng Khoán</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, getDoc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Cấu hình Cố định ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+        
+        const API_KEY = ""; // Sẽ được Canvas cung cấp
+        const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${API_KEY}`;
+
+        let app, db, auth, userId = null;
+        
+        const STOCK_SYMBOL = "FPT_GEMINI";
+        const INITIAL_CASH = 100000;
+        const INITIAL_PRICE = 100; 
+        const TICK_INTERVAL_MS = 1500; 
+        const AI_UPDATE_INTERVAL_TICKS = 15; 
+        const MAX_HISTORY_POINTS = 50;
+        
+        // Cấu hình Biến động Thị trường
+        const VOLATILITY_MAGNITUDE = 0.01; 
+        const AI_BIAS_WEIGHT = 0.7; 
+        const MEAN_REVERSION_RATE = 0.0005; 
+        
+        // Cấu hình Vay Vốn
+        const INTEREST_RATE_PER_TICK = 0.0001; 
+        
+        // --- CẤU HÌNH MỚI: TÁC ĐỘNG GIÁ CỦA NGƯỜI CHƠI ---
+        const HYPOTHETICAL_LIQUIDITY = 50000; // Khối lượng giao dịch giả định cho độ ổn định
+        const PRICE_IMPACT_MULTIPLIER = 0.001; // Hệ số nhạy cảm của giá đối với khối lượng
+
+        // --- Trạng thái Game ---
+        let gameState = {
+            cash: INITIAL_CASH,
+            portfolio: {}, 
+            priceHistory: [{ price: INITIAL_PRICE, tick: 0 }],
+            stockPrice: INITIAL_PRICE, 
+            marketSentiment: 0, 
+            latestNews: "Thị trường đang ổn định.",
+            loanAmount: 0, 
+            lastSave: Date.now()
+        };
+
+        // --- Hàm Tiện ích ---
+        const formatCurrency = (amount) => new Intl.NumberFormat('vi-VN', { style: 'currency', currency: 'VND', minimumFractionDigits: 0 }).format(amount);
+        
+        const calculateTotalValue = () => {
+            const holdings = gameState.portfolio[STOCK_SYMBOL] || { quantity: 0 };
+            // Total Value = Cash + Stock Value - Loan Amount (Liability)
+            return gameState.cash + (holdings.quantity * gameState.stockPrice) - gameState.loanAmount;
+        };
+
+        const getPrivateDocRef = (db, userId, docName) => {
+            return doc(db, 'artifacts', appId, 'users', userId, docName, 'state');
+        };
+
+        // --- Firebase Initialization and Auth ---
+        const initFirebase = async () => {
+            try {
+                setLogLevel('error'); 
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        document.getElementById('user-id').textContent = `ID: ${userId}`;
+                        loadGameState(db, userId);
+                    } else {
+                        userId = null; 
+                        document.getElementById('user-id').textContent = 'Chế độ ẩn danh (Không lưu)';
+                        renderDashboard(); 
+                        startGameLoop();
+                    }
+                });
+            } catch (error) {
+                console.error("Lỗi khi khởi tạo Firebase:", error);
+                showMessage(`Lỗi khởi tạo: ${error.message}`, 'bg-red-500');
+            }
+        };
+        
+        // --- Game Save/Load Logic ---
+        const loadGameState = async (db, userId) => {
+            const docRef = getPrivateDocRef(db, userId, 'stock_game_state_ai'); 
+            try {
+                const docSnap = await getDoc(docRef);
+                if (docSnap.exists()) {
+                    const loadedState = docSnap.data();
+                    gameState = { ...gameState, ...loadedState };
+                    // Đảm bảo các giá trị số được parse đúng
+                    gameState.cash = parseFloat(gameState.cash || INITIAL_CASH);
+                    gameState.stockPrice = parseFloat(gameState.stockPrice || INITIAL_PRICE);
+                    gameState.marketSentiment = parseFloat(gameState.marketSentiment || 0);
+                    gameState.loanAmount = parseFloat(gameState.loanAmount || 0); 
+                    gameState.priceHistory = gameState.priceHistory || [{ price: INITIAL_PRICE, tick: 0 }];
+
+                    showMessage('Tải trạng thái game thành công!', 'bg-green-500');
+                } else {
+                    showMessage(`Bắt đầu game mới với ${formatCurrency(INITIAL_CASH)}.`, 'bg-yellow-500');
+                    await saveGameState(); 
+                }
+                startGameLoop();
+
+            } catch (error) {
+                console.error("Lỗi khi tải trạng thái game:", error);
+                showMessage(`Lỗi tải game: ${error.message}`, 'bg-red-500');
+            }
+        };
+
+        const saveGameState = async () => {
+            if (!db || !userId) return; 
+            try {
+                const docRef = getPrivateDocRef(db, userId, 'stock_game_state_ai');
+                gameState.lastSave = Date.now();
+                await setDoc(docRef, gameState);
+            } catch (error) {
+                console.error("Lỗi khi lưu trạng thái game:", error);
+            }
+        };
+
+        // --- Gemini AI Integration for Market Sentiment ---
+
+        const getGeminiSentiment = async () => {
+            document.getElementById('news-headline').textContent = 'Đang phân tích tin tức thị trường...';
+            document.getElementById('news-headline').classList.add('animate-pulse', 'text-yellow-400');
+            
+            const systemPrompt = `Bạn là một nhà phân tích thị trường chứng khoán giả lập. Nhiệm vụ của bạn là tạo ra một tin tức giả và một hệ số điều chỉnh giá cho mã cổ phiếu FPT_GEMINI.
+                                  Quan trọng: Thị trường phải có chu kỳ tăng và giảm (Bull/Bear). Hãy tạo ra các tin tức tiêu cực và hệ số âm (dưới -0.05) thường xuyên để mô phỏng các đợt sụt giảm mạnh, và tin tức cực kỳ tích cực với hệ số dương lớn (trên 0.05) để tạo ra các đợt tăng trưởng đột phá (như x10).
+                                  Hệ số điều chỉnh (adjustmentFactor) phải là một số thập phân trong khoảng [-0.1, 0.1]. 
+                                  Tin tức (newsHeadline) phải ngắn gọn, hấp dẫn, và bằng Tiếng Việt.
+                                  Giá hiện tại: ${gameState.stockPrice.toFixed(2)}.`;
+            
+            const userQuery = `Hãy tạo một tin tức mới và một hệ số điều chỉnh giá dựa trên tâm lý thị trường giả lập.`;
+            
+            const payload = {
+                contents: [{ parts: [{ text: userQuery }] }],
+                systemInstruction: { parts: [{ text: systemPrompt }] },
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                        type: "OBJECT",
+                        properties: {
+                            "adjustmentFactor": { "type": "NUMBER" },
+                            "newsHeadline": { "type": "STRING" }
+                        },
+                        "propertyOrdering": ["adjustmentFactor", "newsHeadline"]
+                    }
+                }
+            };
+
+            try {
+                const response = await fetch(GEMINI_API_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                
+                const result = await response.json();
+                
+                const candidate = result.candidates?.[0];
+
+                if (candidate && candidate.content?.parts?.[0]?.text) {
+                    const jsonString = candidate.content.parts[0].text;
+                    const parsedJson = JSON.parse(jsonString);
+                    
+                    const factor = parseFloat(parsedJson.adjustmentFactor);
+                    gameState.marketSentiment = Math.max(-0.1, Math.min(0.1, factor)); // Giới hạn từ -0.1 đến 0.1
+                    gameState.latestNews = parsedJson.newsHeadline;
+                    
+                    showMessage(`[TIN MỚI] Hệ số ảnh hưởng: ${gameState.marketSentiment.toFixed(4)}`, 'bg-indigo-600');
+                    showMessage(`[TIN MỚI] ${gameState.latestNews}`, 'bg-indigo-600');
+                }
+
+            } catch (error) {
+                console.error("Lỗi gọi Gemini API (Sử dụng ngẫu nhiên thay thế):", error);
+                // Fallback nếu API lỗi
+                gameState.marketSentiment = (Math.random() * 0.2) - 0.1; 
+                gameState.latestNews = "Lỗi kết nối AI: Thị trường biến động ngẫu nhiên (có thể giảm mạnh).";
+            } finally {
+                document.getElementById('news-headline').textContent = gameState.latestNews;
+                document.getElementById('news-headline').classList.remove('animate-pulse', 'text-yellow-400');
+            }
+        };
+
+        // --- Market Simulation Logic (Main Loop) ---
+        let gameTick = 0;
+        let gameLoopInterval = null;
+
+        const updatePrice = () => {
+            gameTick++;
+            const currentPrice = gameState.stockPrice;
+            
+            // 1. Random Volatility (Ngẫu nhiên cơ bản, đã giảm cường độ)
+            const randomFactor = (Math.random() - 0.5) * 2; 
+            let change = randomFactor * VOLATILITY_MAGNITUDE; 
+            
+            // 2. Mean Reversion (Kéo giá về mức 100 để cân bằng)
+            const targetPrice = INITIAL_PRICE;
+            const reversionBias = (targetPrice - currentPrice) * MEAN_REVERSION_RATE;
+            change += reversionBias;
+
+            // 3. AI Sentiment (Primary driver for big moves - giữ nguyên cường độ)
+            change += gameState.marketSentiment * AI_BIAS_WEIGHT; 
+
+            // Tính toán sự thay đổi giá thực tế
+            const priceChange = change * currentPrice;
+            let newPrice = currentPrice + priceChange;
+
+            newPrice = Math.max(1, newPrice); // Giá tối thiểu là 1
+
+            gameState.stockPrice = newPrice;
+            
+            // 4. Interest calculation: Applied when loanAmount > 0
+            if (gameState.loanAmount > 0) {
+                const interest = gameState.loanAmount * INTEREST_RATE_PER_TICK;
+                gameState.cash -= interest; // Lãi suất trừ trực tiếp vào tiền mặt
+                // Không hiển thị mỗi tick để tránh spam log
+            }
+            
+            // Cập nhật lịch sử và kiểm tra AI
+            gameState.priceHistory.push({ price: newPrice, tick: gameTick });
+            if (gameState.priceHistory.length > MAX_HISTORY_POINTS) {
+                gameState.priceHistory.shift(); 
+            }
+            
+            if (gameTick % AI_UPDATE_INTERVAL_TICKS === 0) {
+                getGeminiSentiment();
+            }
+        };
+
+        const startGameLoop = () => {
+            if (gameLoopInterval) return; 
+            
+            getGeminiSentiment(); 
+
+            gameLoopInterval = setInterval(() => {
+                updatePrice();
+                renderDashboard();
+                renderChart();
+                if (gameTick % 10 === 0) {
+                    saveGameState();
+                }
+            }, TICK_INTERVAL_MS);
+            
+            showMessage('Thị trường bắt đầu giao dịch!', 'bg-blue-500');
+        };
+
+        // --- Transaction Handlers ---
+
+        const updateCostCalculation = () => {
+            const qtyInput = document.getElementById('qty-input');
+            const costDisplay = document.getElementById('cost-display');
+            
+            const quantity = parseInt(qtyInput.value, 10);
+            const currentPrice = gameState.stockPrice;
+            
+            if (isNaN(quantity) || quantity <= 0) {
+                costDisplay.textContent = '0 VND';
+                costDisplay.classList.remove('text-red-400', 'text-yellow-400');
+                costDisplay.classList.add('text-gray-400');
+                return;
+            }
+            
+            const cost = quantity * currentPrice;
+            costDisplay.textContent = formatCurrency(cost);
+            costDisplay.classList.remove('text-gray-400');
+
+            costDisplay.classList.add('text-yellow-400', 'font-extrabold');
+            costDisplay.classList.remove('text-red-400');
+        };
+
+        const handleMaxQuantity = (action) => {
+            const qtyInput = document.getElementById('qty-input');
+            const currentPrice = gameState.stockPrice;
+            let maxQty = 0;
+
+            if (action === 'buy') {
+                if (gameState.cash > 0) {
+                    maxQty = Math.floor(gameState.cash / currentPrice);
+                    showMessage(`Đặt số lượng mua tối đa: ${maxQty}`, 'bg-blue-600');
+                } else {
+                    showMessage('Tiền mặt đang âm. Không thể mua thêm.', 'bg-red-500');
+                    maxQty = 0;
+                }
+                
+            } else if (action === 'sell') {
+                const holdings = gameState.portfolio[STOCK_SYMBOL] || { quantity: 0 };
+                maxQty = holdings.quantity;
+                showMessage(`Đặt số lượng bán tối đa: ${maxQty}`, 'bg-blue-600');
+            }
+
+            qtyInput.value = maxQty > 0 ? maxQty : '';
+            updateCostCalculation();
+        };
+
+
+        const handleBuy = () => {
+            const qtyInput = document.getElementById('qty-input');
+            let quantity = parseInt(qtyInput.value, 10);
+            
+            if (isNaN(quantity) || quantity <= 0) {
+                showMessage('Số lượng mua không hợp lệ.', 'bg-red-500');
+                return;
+            }
+
+            const cost = quantity * gameState.stockPrice;
+            
+            if (cost > gameState.cash && gameState.cash >= 0) {
+                showMessage('Không đủ tiền mặt để thực hiện giao dịch này.', 'bg-red-500');
+                return;
+            }
+
+            // --- LOGIC MỚI: TÁC ĐỘNG GIÁ KHI MUA ---
+            // Giá cổ phiếu tăng khi có lệnh mua lớn
+            const priceImpactChange = (quantity / HYPOTHETICAL_LIQUIDITY) * PRICE_IMPACT_MULTIPLIER * gameState.stockPrice;
+            gameState.stockPrice += priceImpactChange;
+            // ----------------------------------------
+
+
+            gameState.cash -= cost;
+            const holdings = gameState.portfolio[STOCK_SYMBOL] || { quantity: 0, avgPrice: 0 };
+            
+            const totalQuantity = holdings.quantity + quantity;
+            const totalCost = (holdings.quantity * holdings.avgPrice) + cost;
+            
+            holdings.quantity = totalQuantity;
+            holdings.avgPrice = totalCost / totalQuantity;
+
+            gameState.portfolio[STOCK_SYMBOL] = holdings;
+            
+            showMessage(`ĐÃ MUA ${quantity} cổ phiếu. Giá Tăng ${priceImpactChange.toFixed(4)} VND.`, 'bg-green-600');
+            qtyInput.value = ''; 
+            updateCostCalculation(); 
+            renderDashboard();
+            saveGameState();
+        };
+
+        const handleSell = () => {
+            const qtyInput = document.getElementById('qty-input');
+            let quantity = parseInt(qtyInput.value, 10);
+
+            if (isNaN(quantity) || quantity <= 0) {
+                showMessage('Số lượng bán không hợp lệ.', 'bg-red-500');
+                return;
+            }
+
+            const holdings = gameState.portfolio[STOCK_SYMBOL] || { quantity: 0, avgPrice: 0 };
+            if (quantity > holdings.quantity) {
+                showMessage('Bạn không có đủ cổ phiếu để bán.', 'bg-red-500');
+                return;
+            }
+
+            const revenue = quantity * gameState.stockPrice;
+            
+            // --- LOGIC MỚI: TÁC ĐỘNG GIÁ KHI BÁN ---
+            // Giá cổ phiếu giảm khi có lệnh bán lớn
+            const priceImpactChange = (quantity / HYPOTHETICAL_LIQUIDITY) * PRICE_IMPACT_MULTIPLIER * gameState.stockPrice;
+            gameState.stockPrice -= priceImpactChange;
+            // Đảm bảo giá không xuống quá thấp
+            gameState.stockPrice = Math.max(1, gameState.stockPrice); 
+            // ----------------------------------------
+            
+            gameState.cash += revenue;
+            
+            holdings.quantity -= quantity;
+
+            if (holdings.quantity === 0) {
+                delete gameState.portfolio[STOCK_SYMBOL];
+            } else {
+                gameState.portfolio[STOCK_SYMBOL] = holdings;
+            }
+
+            showMessage(`ĐÃ BÁN ${quantity} cổ phiếu. Giá Giảm ${priceImpactChange.toFixed(4)} VND.`, 'bg-red-600');
+            qtyInput.value = ''; 
+            updateCostCalculation();
+            renderDashboard();
+            saveGameState();
+        };
+        
+        // --- Loan Handlers ---
+        
+        const handleBorrow = () => {
+            const amountInput = document.getElementById('loan-amount-input');
+            let amount = parseFloat(amountInput.value);
+
+            if (isNaN(amount) || amount <= 0) {
+                showMessage('Số tiền vay không hợp lệ.', 'bg-red-500');
+                return;
+            }
+
+            gameState.cash += amount;
+            gameState.loanAmount += amount;
+            
+            showMessage(`Đã VAY thành công ${formatCurrency(amount)}. Tổng nợ: ${formatCurrency(gameState.loanAmount)}`, 'bg-red-700');
+            amountInput.value = '';
+            renderDashboard();
+            saveGameState();
+        };
+
+        const handleRepay = () => {
+            const amountInput = document.getElementById('loan-amount-input');
+            let amount = parseFloat(amountInput.value);
+
+            if (isNaN(amount) || amount <= 0) {
+                showMessage('Số tiền trả không hợp lệ.', 'bg-red-500');
+                return;
+            }
+
+            if (gameState.loanAmount === 0) {
+                showMessage('Bạn không có khoản nợ nào để trả.', 'bg-yellow-500');
+                return;
+            }
+            
+            const actualRepayAmount = Math.min(amount, gameState.loanAmount);
+
+            // Check if cash is sufficient for the actual repayment
+            if (actualRepayAmount > gameState.cash) {
+                showMessage(`Không đủ tiền mặt để trả ${formatCurrency(actualRepayAmount)}. Cần ${formatCurrency(actualRepayAmount)}, có ${formatCurrency(gameState.cash)}.`, 'bg-red-500');
+                return;
+            }
+
+            gameState.cash -= actualRepayAmount;
+            gameState.loanAmount -= actualRepayAmount;
+            
+            showMessage(`Đã TRẢ ${formatCurrency(actualRepayAmount)} khoản nợ. Nợ còn lại: ${formatCurrency(gameState.loanAmount)}`, 'bg-green-700');
+            amountInput.value = '';
+            renderDashboard();
+            saveGameState();
+        };
+
+
+        // --- Cash Management (Nạp/Rút) ---
+        const handleCashAction = (action) => {
+            const amountInput = document.getElementById('cash-amount-input');
+            let amount = parseFloat(amountInput.value);
+            
+            if (isNaN(amount) || amount <= 0) {
+                showMessage('Số tiền nạp/rút không hợp lệ.', 'bg-red-500');
+                return;
+            }
+
+            if (action === 'deposit') {
+                gameState.cash += amount;
+                showMessage(`Đã NẠP thành công ${formatCurrency(amount)} vào tài khoản.`, 'bg-green-500');
+            } else if (action === 'withdraw') {
+                if (amount > gameState.cash) {
+                    showMessage('Số tiền rút vượt quá số dư tiền mặt.', 'bg-red-500');
+                    return;
+                }
+                gameState.cash -= amount;
+                showMessage(`Đã RÚT thành công ${formatCurrency(amount)} khỏi tài khoản.`, 'bg-yellow-500');
+            }
+            
+            amountInput.value = '';
+            renderDashboard();
+            saveGameState();
+        };
+
+
+        // --- Rendering Functions ---
+
+        const showMessage = (message, className) => {
+            const logDiv = document.getElementById('message-log');
+            const p = document.createElement('p');
+            p.className = `text-sm font-medium p-2 rounded-lg mb-1 ${className || 'bg-gray-700'}`;
+            p.textContent = `[${new Date().toLocaleTimeString('vi-VN')}] ${message}`;
+            logDiv.prepend(p);
+            while (logDiv.children.length > 50) {
+                logDiv.removeChild(logDiv.lastChild);
+            }
+        };
+
+        const renderDashboard = () => {
+            const holdings = gameState.portfolio[STOCK_SYMBOL] || { quantity: 0, avgPrice: 0 };
+            const currentTotalValue = calculateTotalValue();
+            const initialCapital = INITIAL_CASH; 
+            const pnl = currentTotalValue - initialCapital;
+            const pnlPercent = (pnl / initialCapital) * 100;
+
+            const cashClass = gameState.cash >= 0 ? 'text-yellow-300' : 'text-red-400';
+            const debtClass = gameState.loanAmount > 0 ? 'text-red-400' : 'text-gray-400';
+            const profitClass = pnl >= 0 ? 'text-green-400' : 'text-red-400';
+            
+            // So sánh giá hiện tại với giá cũ trong lịch sử để xác định màu
+            let priceClass = 'text-gray-300';
+            if (gameState.priceHistory.length > 1) {
+                const lastPrice = gameState.priceHistory[gameState.priceHistory.length - 1].price;
+                const prevPrice = gameState.priceHistory[gameState.priceHistory.length - 2].price;
+                if (lastPrice > prevPrice) {
+                    priceClass = 'text-green-400';
+                } else if (lastPrice < prevPrice) {
+                    priceClass = 'text-red-400';
+                }
+            }
+
+
+            // Cập nhật Tiền Mặt
+            document.getElementById('cash-main').textContent = formatCurrency(gameState.cash);
+            document.getElementById('cash-main').className = `text-4xl font-black mt-1 ${cashClass}`;
+
+            // Cập nhật Nợ Vay
+            document.getElementById('current-debt').textContent = formatCurrency(gameState.loanAmount);
+            document.getElementById('current-debt').className = `text-lg font-bold ${debtClass}`;
+
+
+            document.getElementById('stock-price').textContent = formatCurrency(gameState.stockPrice);
+            document.getElementById('stock-price').className = `text-3xl font-extrabold ${priceClass}`;
+
+            document.getElementById('total-value').textContent = formatCurrency(currentTotalValue);
+            document.getElementById('holdings-qty').textContent = holdings.quantity.toLocaleString('vi-VN');
+            document.getElementById('avg-price').textContent = formatCurrency(holdings.avgPrice);
+            
+            let positionPnl = 0;
+            if (holdings.quantity > 0) {
+                positionPnl = holdings.quantity * (gameState.stockPrice - holdings.avgPrice);
+            }
+            const positionPnlClass = positionPnl >= 0 ? 'text-green-400' : 'text-red-400';
+            document.getElementById('position-pnl').textContent = formatCurrency(positionPnl);
+            
+            document.getElementById('total-pnl').innerHTML = `
+                <span class="${profitClass}">${formatCurrency(pnl)}</span> 
+                <span class="text-xs ${profitClass}">(${pnlPercent.toFixed(2)}%)</span>
+            `;
+            
+            document.getElementById('news-headline').textContent = gameState.latestNews;
+        };
+
+        const renderChart = () => {
+            const canvas = document.getElementById('stock-chart');
+            const ctx = canvas.getContext('2d');
+            const data = gameState.priceHistory.map(p => p.price);
+
+            canvas.width = canvas.offsetWidth;
+            canvas.height = canvas.offsetHeight;
+            
+            if (data.length < 2) { return; }
+
+            ctx.fillStyle = '#1f2937'; 
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            const padding = 20;
+            const chartWidth = canvas.width - padding * 2;
+            const chartHeight = canvas.height - padding * 2;
+            const minPrice = Math.min(...data);
+            const maxPrice = Math.max(...data);
+            const priceRange = (maxPrice - minPrice) * 1.1; 
+            const adjustedMinPrice = minPrice - (priceRange * 0.05); 
+            const stepX = chartWidth / (data.length - 1);
+            
+            ctx.beginPath();
+            ctx.strokeStyle = '#34d399'; 
+            ctx.lineWidth = 2;
+            
+            data.forEach((price, index) => {
+                const x = padding + index * stepX;
+                const y = padding + chartHeight - ((price - adjustedMinPrice) / priceRange) * chartHeight;
+                
+                if (index === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            });
+            ctx.stroke();
+
+            // Vẽ điểm giá hiện tại
+            const lastPrice = data[data.length - 1];
+            const lastX = padding + (data.length - 1) * stepX;
+            const lastY = padding + chartHeight - ((lastPrice - adjustedMinPrice) / priceRange) * chartHeight;
+            
+            ctx.beginPath();
+            ctx.arc(lastX, lastY, 5, 0, Math.PI * 2, false);
+            ctx.fillStyle = '#fde047'; 
+            ctx.fill();
+
+            // Hiển thị giá hiện tại
+            ctx.fillStyle = '#ffffff';
+            ctx.font = '14px Inter';
+            ctx.textAlign = 'left';
+            ctx.fillText(formatCurrency(lastPrice), lastX + 10, lastY - 5);
+        };
+
+        // --- Event Listeners and Initial Load ---
+        window.onload = () => {
+            // Transaction Handlers
+            document.getElementById('qty-input').addEventListener('input', updateCostCalculation);
+            document.getElementById('buy-btn').addEventListener('click', handleBuy);
+            document.getElementById('sell-btn').addEventListener('click', handleSell);
+            
+            // Max Buy/Sell Handlers
+            document.getElementById('max-buy-btn').addEventListener('click', () => handleMaxQuantity('buy'));
+            document.getElementById('max-sell-btn').addEventListener('click', () => handleMaxQuantity('sell'));
+
+            // Cash Management Handlers
+            document.getElementById('deposit-btn').addEventListener('click', () => handleCashAction('deposit'));
+            document.getElementById('withdraw-btn').addEventListener('click', () => handleCashAction('withdraw'));
+
+            // Loan Handlers
+            document.getElementById('borrow-btn').addEventListener('click', handleBorrow);
+            document.getElementById('repay-btn').addEventListener('click', handleRepay);
+
+            initFirebase();
+            
+            window.addEventListener('resize', renderChart);
+        };
+    </script>
+    <style>
+        /* Đảm bảo canvas chiếm hết không gian container */
+        #stock-chart {
+            width: 100%;
+            height: 250px; 
+            max-width: 100%;
+            display: block;
+        }
+        /* Tùy chỉnh màu sắc và font cho giao diện tài chính */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #0f172a; /* Màu nền rất tối */
+            color: #e2e8f0; /* Màu chữ sáng */
+        }
+    </style>
+</head>
+<body class="p-2 sm:p-4">
+
+    <div class="max-w-4xl mx-auto space-y-4">
+        <!-- HEADER VÀ HIỂN THỊ TIỀN MẶT NỔI BẬT -->
+        <header class="text-center p-4 bg-gray-900 rounded-xl shadow-2xl border-b border-gray-700 sticky top-0 z-10">
+            <h1 class="text-3xl font-extrabold text-white">Day Trader Simulator</h1>
+            <p id="user-id" class="text-xs text-gray-400 mt-1">Đang kết nối...</p>
+            <div class="mt-4 p-3 bg-indigo-800/50 rounded-lg shadow-inner">
+                <p class="text-sm text-indigo-300 font-semibold uppercase">TIỀN MẶT CÓ SẴN</p>
+                <p id="cash-main" class="text-4xl font-black mt-1 text-yellow-300">--</p>
+            </div>
+        </header>
+
+        <!-- DASHBOARD TỔNG QUAN -->
+        <section class="grid grid-cols-2 gap-3 p-4 bg-gray-800 rounded-xl shadow-md">
+            <!-- Tổng tài sản Ròng (Net Value) -->
+            <div class="bg-gray-700 p-3 rounded-lg">
+                <p class="text-sm text-gray-400">TỔNG TÀI SẢN RÒNG</p>
+                <p id="total-value" class="text-xl font-bold text-yellow-400">--</p>
+            </div>
+            <!-- LÃI/LỖ Tổng thể -->
+            <div class="bg-gray-700 p-3 rounded-lg">
+                <p class="text-sm text-gray-400">TỔNG LÃI/LỖ</p>
+                <p id="total-pnl" class="text-xl font-bold">--</p>
+            </div>
+        </section>
+
+        <!-- BIỂU ĐỒ VÀ GIÁ CỔ PHIẾU -->
+        <section class="p-4 bg-gray-800 rounded-xl shadow-md space-y-3">
+            <h2 class="text-xl font-semibold text-white">Mã: FPT_GEMINI</h2>
+            <!-- Tin tức AI -->
+            <p id="news-headline" class="p-2 bg-gray-700 text-sm italic rounded-lg text-white">Tin tức đang được tải...</p>
+
+            <div class="flex justify-between items-center mb-2">
+                <p class="text-sm text-gray-400">GIÁ HIỆN TẠI</p>
+                <p id="stock-price" class="text-3xl font-extrabold text-white">--</p>
+            </div>
+            <!-- Vùng Canvas cho biểu đồ -->
+            <div class="h-64 bg-gray-900 rounded-lg overflow-hidden border border-gray-700">
+                <canvas id="stock-chart" class="w-full h-full"></canvas>
+            </div>
+        </section>
+        
+        <!-- DANH MỤC ĐẦU TƯ -->
+        <section class="p-4 bg-gray-800 rounded-xl shadow-md space-y-2">
+            <h2 class="text-xl font-semibold border-b border-gray-700 pb-2">Vị Thế Đang Giữ</h2>
+            <div class="grid grid-cols-3 gap-3">
+                <div class="bg-gray-700 p-3 rounded-lg col-span-1">
+                    <p class="text-sm text-gray-400">SỐ LƯỢNG</p>
+                    <p id="holdings-qty" class="text-xl font-bold text-indigo-400">0</p>
+                </div>
+                <div class="bg-gray-700 p-3 rounded-lg col-span-2">
+                    <p class="text-sm text-gray-400">GIÁ TB MUA</p>
+                    <p id="avg-price" class="text-xl font-bold text-gray-300">--</p>
+                </div>
+                <div class="col-span-3 bg-gray-700 p-3 rounded-lg">
+                    <p class="text-sm text-gray-400">LÃI/LỖ VỊ THẾ</p>
+                    <p id="position-pnl" class="text-xl font-bold">--</p>
+                </div>
+            </div>
+        </section>
+
+
+        <!-- KHUNG GIAO DỊCH -->
+        <section class="p-4 bg-gray-800 rounded-xl shadow-md space-y-3">
+            <h2 class="text-xl font-semibold border-b border-gray-700 pb-2">Giao Dịch</h2>
+            
+            <!-- Nhập Số lượng & Nút MAX -->
+            <div class="flex flex-col space-y-2">
+                <label for="qty-input" class="text-sm text-gray-400">Số Lượng Cổ Phiếu:</label>
+                <div class="flex space-x-2">
+                    <input type="number" id="qty-input" placeholder="Nhập Số Lượng" min="1" class="flex-grow p-3 rounded-lg bg-gray-700 text-white border border-gray-600 focus:ring-yellow-500 focus:border-yellow-500 transition duration-150">
+                    <button id="max-buy-btn" class="p-2 rounded-lg font-bold text-sm text-white bg-green-700 hover:bg-green-800 transition duration-150 w-1/4">MAX MUA</button>
+                    <button id="max-sell-btn" class="p-2 rounded-lg font-bold text-sm text-white bg-red-700 hover:bg-red-800 transition duration-150 w-1/4">MAX BÁN</button>
+                </div>
+                
+                <p class="text-sm text-gray-400 flex justify-between">
+                    <span>Tổng Chi Phí/Doanh Thu Dự Kiến:</span>
+                    <span id="cost-display" class="text-yellow-400 font-extrabold">0 VND</span>
+                </p>
+            </div>
+            
+            <div class="flex space-x-3">
+                <button id="buy-btn" data-action="buy" class="w-1/2 p-3 rounded-lg font-bold text-white bg-green-600 hover:bg-green-700 transition duration-150 shadow-lg shadow-green-900/50">
+                    MUA (BUY)
+                </button>
+                <button id="sell-btn" data-action="sell" class="w-1/2 p-3 rounded-lg font-bold text-white bg-red-600 hover:bg-red-700 transition duration-150 shadow-lg shadow-red-900/50">
+                    BÁN (SELL)
+                </button>
+            </div>
+        </section>
+        
+        <!-- KHUNG VAY VỐN & NỢ -->
+        <section class="p-4 bg-gray-800 rounded-xl shadow-md space-y-3">
+            <h2 class="text-xl font-semibold border-b border-gray-700 pb-2 flex justify-between items-center">
+                <span>Quản Lý Nợ Vay</span>
+                <span id="current-debt" class="text-lg font-bold text-red-400">--</span>
+            </h2>
+            
+            <p class="text-xs text-gray-400">Lãi suất: 0.01% / tick (Lãi suất trừ vào tiền mặt mỗi 1.5s)</p>
+
+            <input type="number" id="loan-amount-input" placeholder="Số Tiền Vay / Trả (VND)" min="1000" class="w-full p-3 rounded-lg bg-gray-700 text-white border border-gray-600 focus:ring-red-500 focus:border-red-500 transition duration-150">
+            <div class="flex space-x-3">
+                <button id="borrow-btn" class="w-1/2 p-3 rounded-lg font-bold text-white bg-indigo-700 hover:bg-indigo-800 transition duration-150 shadow-lg shadow-indigo-900/50">
+                    VAY TIỀN
+                </button>
+                <button id="repay-btn" class="w-1/2 p-3 rounded-lg font-bold text-white bg-pink-600 hover:bg-pink-700 transition duration-150 shadow-lg shadow-pink-900/50">
+                    TRẢ NỢ
+                </button>
+            </div>
+        </section>
+
+        <!-- NẠP/RÚT TIỀN -->
+        <section class="p-4 bg-gray-800 rounded-xl shadow-md space-y-3">
+            <h2 class="text-xl font-semibold border-b border-gray-700 pb-2">Nạp/Rút Tiền Mặt</h2>
+            <input type="number" id="cash-amount-input" placeholder="Nhập Số Tiền (VND)" min="1000" class="w-full p-3 rounded-lg bg-gray-700 text-white border border-gray-600 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150">
+            <div class="flex space-x-3">
+                <button id="deposit-btn" class="w-1/2 p-3 rounded-lg font-bold text-white bg-green-500 hover:bg-green-600 transition duration-150 shadow-lg shadow-green-900/50">
+                    NẠP TIỀN
+                </button>
+                <button id="withdraw-btn" class="w-1/2 p-3 rounded-lg font-bold text-white bg-yellow-500 hover:bg-yellow-600 transition duration-150 shadow-lg shadow-yellow-900/50">
+                    RÚT TIỀN
+                </button>
+            </div>
+        </section>
+
+        <!-- LỊCH SỬ GIAO DỊCH -->
+        <section class="p-4 bg-gray-800 rounded-xl shadow-md">
+            <h2 class="text-xl font-semibold border-b border-gray-700 pb-2">Nhật Ký Thị Trường</h2>
+            <div id="message-log" class="mt-3 h-48 overflow-y-auto space-y-1 text-white">
+                <!-- Log messages will appear here -->
+                <p class="text-sm text-gray-400 p-2 rounded-lg bg-gray-700">Chờ kết nối Firebase để tải trạng thái game...</p>
+            </div>
+        </section>
+
+    </div>
+</body>
+</html>
+
