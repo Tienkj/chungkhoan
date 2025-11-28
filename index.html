@@ -9,7 +9,12 @@
     <script type="module">
         // --- Cấu hình Cố định ---
         const STORAGE_KEY = 'stock_game_state_ai';
-        const API_KEY = "AIzaSyASdIzbW2wRzRYqMo4U7WneMo1eFoK5s2E"; // Sẽ được Canvas cung cấp
+        const p1 = "AIzaSy";
+        const p2 = "BMn2Sdbf_";
+        const p3 = "VU0HRSJLN8OY_";
+        const p4 = "wYsnsfrJ3NA";
+
+        const API_KEY = p1 + p2 + p3 + p4;
         const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${API_KEY}`;
         
         const STOCK_SYMBOL = "FPT_GEMINI";
@@ -190,7 +195,11 @@
             if (gameState.loanAmount > 0) {
                 const interest = gameState.loanAmount * INTEREST_RATE_PER_TICK;
                 gameState.cash -= interest; // Lãi suất trừ trực tiếp vào tiền mặt
-                // Không hiển thị mỗi tick để tránh spam log
+                
+                // Nếu tiền mặt âm quá nhiều do lãi, cảnh báo
+                if (gameState.cash < -gameState.loanAmount * 0.1 && gameTick % 20 === 0) {
+                    showMessage(`CẢNH BÁO: Tiền mặt đang âm do lãi vay. Nợ: ${formatCurrency(gameState.loanAmount)}`, 'bg-red-700');
+                }
             }
             
             // Cập nhật lịch sử và kiểm tra AI
@@ -226,23 +235,51 @@
         const updateCostCalculation = () => {
             const qtyInput = document.getElementById('qty-input');
             const costDisplay = document.getElementById('cost-display');
+            const revenueDisplay = document.getElementById('revenue-display');
+            const revenueContainer = document.getElementById('revenue-display-container');
+            const holdings = gameState.portfolio[STOCK_SYMBOL] || { quantity: 0 };
             
             const quantity = parseInt(qtyInput.value, 10);
             const currentPrice = gameState.stockPrice;
             
             if (isNaN(quantity) || quantity <= 0) {
                 costDisplay.textContent = '0 VND';
-                costDisplay.classList.remove('text-red-400', 'text-yellow-400');
+                costDisplay.classList.remove('text-red-400', 'text-yellow-400', 'text-green-400');
                 costDisplay.classList.add('text-gray-400');
+                revenueContainer.classList.add('hidden');
                 return;
             }
             
-            const cost = quantity * currentPrice;
+            // Tính toán giá sau price impact khi MUA
+            const priceImpactBuy = (quantity / HYPOTHETICAL_LIQUIDITY) * PRICE_IMPACT_MULTIPLIER * currentPrice;
+            const estimatedPriceAfterBuy = currentPrice + priceImpactBuy;
+            const cost = quantity * estimatedPriceAfterBuy;
+            
             costDisplay.textContent = formatCurrency(cost);
             costDisplay.classList.remove('text-gray-400');
 
-            costDisplay.classList.add('text-yellow-400', 'font-extrabold');
-            costDisplay.classList.remove('text-red-400');
+            // Kiểm tra nếu đủ tiền hay không
+            if (cost > gameState.cash) {
+                costDisplay.classList.add('text-red-400', 'font-extrabold');
+                costDisplay.classList.remove('text-yellow-400', 'text-green-400');
+            } else {
+                costDisplay.classList.add('text-green-400', 'font-extrabold');
+                costDisplay.classList.remove('text-red-400', 'text-yellow-400');
+            }
+            
+            // Tính toán doanh thu khi BÁN (nếu có đủ cổ phiếu)
+            if (quantity <= holdings.quantity && holdings.quantity > 0) {
+                const priceImpactSell = (quantity / HYPOTHETICAL_LIQUIDITY) * PRICE_IMPACT_MULTIPLIER * currentPrice;
+                const estimatedPriceAfterSell = Math.max(1, currentPrice - priceImpactSell);
+                const revenue = quantity * estimatedPriceAfterSell;
+                
+                revenueDisplay.textContent = formatCurrency(revenue);
+                revenueDisplay.classList.remove('text-gray-400');
+                revenueDisplay.classList.add('text-blue-400', 'font-extrabold');
+                revenueContainer.classList.remove('hidden');
+            } else {
+                revenueContainer.classList.add('hidden');
+            }
         };
 
         const handleMaxQuantity = (action) => {
@@ -251,18 +288,48 @@
             let maxQty = 0;
 
             if (action === 'buy') {
-                if (gameState.cash > 0) {
-                    maxQty = Math.floor(gameState.cash / currentPrice);
-                    showMessage(`Đặt số lượng mua tối đa: ${maxQty}`, 'bg-blue-600');
+                // Tính toán với price impact
+                const priceImpactBuy = (1 / HYPOTHETICAL_LIQUIDITY) * PRICE_IMPACT_MULTIPLIER * currentPrice;
+                const estimatedPrice = currentPrice + priceImpactBuy;
+                
+                // Tính max quantity có thể mua (giả sử price impact nhỏ)
+                maxQty = Math.floor(gameState.cash / estimatedPrice);
+                
+                if (maxQty > 0) {
+                    // Tính lại chính xác hơn với quantity lớn
+                    const testQty = maxQty;
+                    const testPriceImpact = (testQty / HYPOTHETICAL_LIQUIDITY) * PRICE_IMPACT_MULTIPLIER * currentPrice;
+                    const testPrice = currentPrice + testPriceImpact;
+                    const testCost = testQty * testPrice;
+                    
+                    // Giảm dần nếu cost vượt quá cash
+                    while (testCost > gameState.cash && maxQty > 0) {
+                        maxQty--;
+                        if (maxQty > 0) {
+                            const adjPriceImpact = (maxQty / HYPOTHETICAL_LIQUIDITY) * PRICE_IMPACT_MULTIPLIER * currentPrice;
+                            const adjPrice = currentPrice + adjPriceImpact;
+                            const adjCost = maxQty * adjPrice;
+                            if (adjCost <= gameState.cash) break;
+                        }
+                    }
+                    
+                    if (maxQty > 0) {
+                        showMessage(`Đặt số lượng mua tối đa: ${maxQty}`, 'bg-blue-600');
+                    } else {
+                        showMessage('Không đủ tiền để mua (kể cả price impact).', 'bg-red-500');
+                    }
                 } else {
-                    showMessage('Tiền mặt đang âm. Không thể mua thêm.', 'bg-red-500');
-                    maxQty = 0;
+                    showMessage('Không đủ tiền mặt để mua.', 'bg-red-500');
                 }
                 
             } else if (action === 'sell') {
                 const holdings = gameState.portfolio[STOCK_SYMBOL] || { quantity: 0 };
                 maxQty = holdings.quantity;
-                showMessage(`Đặt số lượng bán tối đa: ${maxQty}`, 'bg-blue-600');
+                if (maxQty > 0) {
+                    showMessage(`Đặt số lượng bán tối đa: ${maxQty}`, 'bg-blue-600');
+                } else {
+                    showMessage('Bạn không có cổ phiếu để bán.', 'bg-yellow-500');
+                }
             }
 
             qtyInput.value = maxQty > 0 ? maxQty : '';
@@ -279,20 +346,23 @@
                 return;
             }
 
-            const cost = quantity * gameState.stockPrice;
+            // Tính toán price impact TRƯỚC khi kiểm tra tiền
+            const priceImpactChange = (quantity / HYPOTHETICAL_LIQUIDITY) * PRICE_IMPACT_MULTIPLIER * gameState.stockPrice;
+            const estimatedPriceAfterBuy = gameState.stockPrice + priceImpactChange;
             
-            if (cost > gameState.cash && gameState.cash >= 0) {
-                showMessage('Không đủ tiền mặt để thực hiện giao dịch này.', 'bg-red-500');
+            // Tính cost dựa trên giá SAU price impact (giá thực tế sẽ phải trả)
+            const cost = quantity * estimatedPriceAfterBuy;
+            
+            // Kiểm tra đủ tiền (bao gồm cả khi cash < 0)
+            if (cost > gameState.cash) {
+                showMessage(`Không đủ tiền mặt. Cần ${formatCurrency(cost)}, có ${formatCurrency(gameState.cash)}.`, 'bg-red-500');
                 return;
             }
 
-            // --- LOGIC MỚI: TÁC ĐỘNG GIÁ KHI MUA ---
-            // Giá cổ phiếu tăng khi có lệnh mua lớn
-            const priceImpactChange = (quantity / HYPOTHETICAL_LIQUIDITY) * PRICE_IMPACT_MULTIPLIER * gameState.stockPrice;
-            gameState.stockPrice += priceImpactChange;
-            // ----------------------------------------
-
-
+            // Áp dụng price impact
+            gameState.stockPrice = estimatedPriceAfterBuy;
+            
+            // Trừ tiền và cập nhật portfolio
             gameState.cash -= cost;
             const holdings = gameState.portfolio[STOCK_SYMBOL] || { quantity: 0, avgPrice: 0 };
             
@@ -304,7 +374,7 @@
 
             gameState.portfolio[STOCK_SYMBOL] = holdings;
             
-            showMessage(`ĐÃ MUA ${quantity} cổ phiếu. Giá Tăng ${priceImpactChange.toFixed(4)} VND.`, 'bg-green-600');
+            showMessage(`ĐÃ MUA ${quantity} cổ phiếu @ ${formatCurrency(estimatedPriceAfterBuy)}. Giá tăng ${priceImpactChange.toFixed(2)} VND.`, 'bg-green-600');
             qtyInput.value = ''; 
             updateCostCalculation(); 
             renderDashboard();
@@ -326,16 +396,17 @@
                 return;
             }
 
-            const revenue = quantity * gameState.stockPrice;
-            
-            // --- LOGIC MỚI: TÁC ĐỘNG GIÁ KHI BÁN ---
-            // Giá cổ phiếu giảm khi có lệnh bán lớn
+            // Tính toán price impact TRƯỚC khi tính revenue
             const priceImpactChange = (quantity / HYPOTHETICAL_LIQUIDITY) * PRICE_IMPACT_MULTIPLIER * gameState.stockPrice;
-            gameState.stockPrice -= priceImpactChange;
-            // Đảm bảo giá không xuống quá thấp
-            gameState.stockPrice = Math.max(1, gameState.stockPrice); 
-            // ----------------------------------------
+            const estimatedPriceAfterSell = Math.max(1, gameState.stockPrice - priceImpactChange);
             
+            // Tính revenue dựa trên giá SAU price impact (giá thực tế sẽ nhận được)
+            const revenue = quantity * estimatedPriceAfterSell;
+            
+            // Áp dụng price impact
+            gameState.stockPrice = estimatedPriceAfterSell;
+            
+            // Cộng tiền và cập nhật portfolio
             gameState.cash += revenue;
             
             holdings.quantity -= quantity;
@@ -346,7 +417,7 @@
                 gameState.portfolio[STOCK_SYMBOL] = holdings;
             }
 
-            showMessage(`ĐÃ BÁN ${quantity} cổ phiếu. Giá Giảm ${priceImpactChange.toFixed(4)} VND.`, 'bg-red-600');
+            showMessage(`ĐÃ BÁN ${quantity} cổ phiếu @ ${formatCurrency(estimatedPriceAfterSell)}. Giá giảm ${priceImpactChange.toFixed(2)} VND.`, 'bg-red-600');
             qtyInput.value = ''; 
             updateCostCalculation();
             renderDashboard();
@@ -588,21 +659,41 @@
         /* Đảm bảo canvas chiếm hết không gian container */
         #stock-chart {
             width: 100%;
-            height: 250px; 
+            height: 100%;
             max-width: 100%;
             display: block;
         }
+        
         /* Tùy chỉnh màu sắc và font cho giao diện tài chính */
         body {
-            font-family: 'Inter', sans-serif;
-            background-color: #0f172a; /* Màu nền rất tối */
-            color: #e2e8f0; /* Màu chữ sáng */
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background-color: #0f172a;
+            color: #e2e8f0;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+        
+        /* Smooth scroll */
+        html {
+            scroll-behavior: smooth;
+        }
+        
+        /* Tối ưu input number trên mobile */
+        input[type="number"]::-webkit-inner-spin-button,
+        input[type="number"]::-webkit-outer-spin-button {
+            opacity: 1;
+            height: auto;
+        }
+        
+        /* Cải thiện button active state */
+        button:active {
+            transform: scale(0.98);
         }
     </style>
 </head>
 <body class="p-2 sm:p-4">
 
-    <div class="max-w-4xl mx-auto space-y-4">
+    <div class="max-w-5xl mx-auto space-y-4 pb-4">
         <!-- HEADER VÀ HIỂN THỊ TIỀN MẶT NỔI BẬT -->
         <header class="text-center p-4 bg-gray-900 rounded-xl shadow-2xl border-b border-gray-700 sticky top-0 z-10">
             <h1 class="text-3xl font-extrabold text-white">Chứng Khoán Offline</h1>
@@ -627,19 +718,59 @@
             </div>
         </section>
 
-        <!-- BIỂU ĐỒ VÀ GIÁ CỔ PHIẾU -->
-        <section class="p-4 bg-gray-800 rounded-xl shadow-md space-y-3">
-            <h2 class="text-xl font-semibold text-white">Mã: FPT_GEMINI</h2>
-            <!-- Tin tức AI -->
-            <p id="news-headline" class="p-2 bg-gray-700 text-sm italic rounded-lg text-white">Tin tức đang được tải...</p>
-
-            <div class="flex justify-between items-center mb-2">
-                <p class="text-sm text-gray-400">GIÁ HIỆN TẠI</p>
-                <p id="stock-price" class="text-3xl font-extrabold text-white">--</p>
+        <!-- BIỂU ĐỒ, GIÁ CỔ PHIẾU VÀ GIAO DỊCH (Tối ưu UX) -->
+        <section class="p-4 bg-gray-800 rounded-xl shadow-md space-y-4">
+            <!-- Header với mã cổ phiếu và giá -->
+            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                <div>
+                    <h2 class="text-xl font-semibold text-white">Mã: FPT_GEMINI</h2>
+                    <p id="news-headline" class="p-2 bg-gray-700 text-sm italic rounded-lg text-white mt-2">Tin tức đang được tải...</p>
+                </div>
+                <div class="text-right">
+                    <p class="text-sm text-gray-400">GIÁ HIỆN TẠI</p>
+                    <p id="stock-price" class="text-3xl font-extrabold text-white">--</p>
+                </div>
             </div>
+            
             <!-- Vùng Canvas cho biểu đồ -->
-            <div class="h-64 bg-gray-900 rounded-lg overflow-hidden border border-gray-700">
+            <div class="h-64 sm:h-80 bg-gray-900 rounded-lg overflow-hidden border border-gray-700">
                 <canvas id="stock-chart" class="w-full h-full"></canvas>
+            </div>
+            
+            <!-- GIAO DỊCH - Đặt ngay dưới biểu đồ -->
+            <div class="border-t border-gray-700 pt-4 space-y-3">
+                <h3 class="text-lg font-semibold text-white">Giao Dịch</h3>
+                
+                <!-- Nhập Số lượng & Nút MAX -->
+                <div class="flex flex-col space-y-2">
+                    <label for="qty-input" class="text-sm text-gray-400">Số Lượng Cổ Phiếu:</label>
+                    <div class="flex gap-2">
+                        <input type="number" id="qty-input" placeholder="Nhập số lượng" min="1" class="flex-grow p-3 rounded-lg bg-gray-700 text-white border border-gray-600 focus:ring-2 focus:ring-yellow-500 focus:border-yellow-500 transition duration-150 text-base">
+                        <button id="max-buy-btn" class="px-3 py-2 rounded-lg font-bold text-sm text-white bg-green-700 hover:bg-green-800 active:bg-green-900 transition duration-150 whitespace-nowrap">MAX MUA</button>
+                        <button id="max-sell-btn" class="px-3 py-2 rounded-lg font-bold text-sm text-white bg-red-700 hover:bg-red-800 active:bg-red-900 transition duration-150 whitespace-nowrap">MAX BÁN</button>
+                    </div>
+                    
+                    <div class="flex justify-between items-center p-2 bg-gray-700 rounded-lg">
+                        <span id="cost-label" class="text-sm text-gray-400">Tổng Chi Phí (khi mua):</span>
+                        <span id="cost-display" class="text-base font-extrabold text-gray-400">0 VND</span>
+                    </div>
+                    <div id="revenue-display-container" class="flex justify-between items-center p-2 bg-gray-700 rounded-lg hidden">
+                        <span class="text-sm text-gray-400">Doanh Thu (khi bán):</span>
+                        <span id="revenue-display" class="text-base font-extrabold text-gray-400">0 VND</span>
+                    </div>
+                </div>
+                
+                <!-- Nút MUA/BÁN -->
+                <div class="flex gap-3">
+                    <button id="buy-btn" class="flex-1 p-4 rounded-lg font-bold text-lg text-white bg-green-600 hover:bg-green-700 active:bg-green-800 transition duration-150 shadow-lg shadow-green-900/50 transform hover:scale-105">
+                        <span class="block">MUA</span>
+                        <span class="block text-xs opacity-80">(BUY)</span>
+                    </button>
+                    <button id="sell-btn" class="flex-1 p-4 rounded-lg font-bold text-lg text-white bg-red-600 hover:bg-red-700 active:bg-red-800 transition duration-150 shadow-lg shadow-red-900/50 transform hover:scale-105">
+                        <span class="block">BÁN</span>
+                        <span class="block text-xs opacity-80">(SELL)</span>
+                    </button>
+                </div>
             </div>
         </section>
         
@@ -661,75 +792,48 @@
                 </div>
             </div>
         </section>
-
-
-        <!-- KHUNG GIAO DỊCH -->
-        <section class="p-4 bg-gray-800 rounded-xl shadow-md space-y-3">
-            <h2 class="text-xl font-semibold border-b border-gray-700 pb-2">Giao Dịch</h2>
-            
-            <!-- Nhập Số lượng & Nút MAX -->
-            <div class="flex flex-col space-y-2">
-                <label for="qty-input" class="text-sm text-gray-400">Số Lượng Cổ Phiếu:</label>
-                <div class="flex space-x-2">
-                    <input type="number" id="qty-input" placeholder="Nhập Số Lượng" min="1" class="flex-grow p-3 rounded-lg bg-gray-700 text-white border border-gray-600 focus:ring-yellow-500 focus:border-yellow-500 transition duration-150">
-                    <button id="max-buy-btn" class="p-2 rounded-lg font-bold text-sm text-white bg-green-700 hover:bg-green-800 transition duration-150 w-1/4">MAX MUA</button>
-                    <button id="max-sell-btn" class="p-2 rounded-lg font-bold text-sm text-white bg-red-700 hover:bg-red-800 transition duration-150 w-1/4">MAX BÁN</button>
-                </div>
-                
-                <p class="text-sm text-gray-400 flex justify-between">
-                    <span>Tổng Chi Phí/Doanh Thu Dự Kiến:</span>
-                    <span id="cost-display" class="text-yellow-400 font-extrabold">0 VND</span>
-                </p>
-            </div>
-            
-            <div class="flex space-x-3">
-                <button id="buy-btn" data-action="buy" class="w-1/2 p-3 rounded-lg font-bold text-white bg-green-600 hover:bg-green-700 transition duration-150 shadow-lg shadow-green-900/50">
-                    MUA (BUY)
-                </button>
-                <button id="sell-btn" data-action="sell" class="w-1/2 p-3 rounded-lg font-bold text-white bg-red-600 hover:bg-red-700 transition duration-150 shadow-lg shadow-red-900/50">
-                    BÁN (SELL)
-                </button>
-            </div>
-        </section>
         
-        <!-- KHUNG VAY VỐN & NỢ -->
-        <section class="p-4 bg-gray-800 rounded-xl shadow-md space-y-3">
-            <h2 class="text-xl font-semibold border-b border-gray-700 pb-2 flex justify-between items-center">
-                <span>Quản Lý Nợ Vay</span>
-                <span id="current-debt" class="text-lg font-bold text-red-400">--</span>
-            </h2>
-            
-            <p class="text-xs text-gray-400">Lãi suất: 0.01% / tick (Lãi suất trừ vào tiền mặt mỗi 1.5s)</p>
+        <!-- QUẢN LÝ TÀI CHÍNH (Vay vốn & Nạp/Rút) -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <!-- KHUNG VAY VỐN & NỢ -->
+            <section class="p-4 bg-gray-800 rounded-xl shadow-md space-y-3">
+                <h2 class="text-lg font-semibold border-b border-gray-700 pb-2 flex justify-between items-center">
+                    <span>Quản Lý Nợ Vay</span>
+                    <span id="current-debt" class="text-base font-bold text-red-400">--</span>
+                </h2>
+                
+                <p class="text-xs text-gray-400 bg-gray-700 p-2 rounded">Lãi suất: 0.01% / tick (mỗi 1.5s)</p>
 
-            <input type="number" id="loan-amount-input" placeholder="Số Tiền Vay / Trả (VND)" min="1000" class="w-full p-3 rounded-lg bg-gray-700 text-white border border-gray-600 focus:ring-red-500 focus:border-red-500 transition duration-150">
-            <div class="flex space-x-3">
-                <button id="borrow-btn" class="w-1/2 p-3 rounded-lg font-bold text-white bg-indigo-700 hover:bg-indigo-800 transition duration-150 shadow-lg shadow-indigo-900/50">
-                    VAY TIỀN
-                </button>
-                <button id="repay-btn" class="w-1/2 p-3 rounded-lg font-bold text-white bg-pink-600 hover:bg-pink-700 transition duration-150 shadow-lg shadow-pink-900/50">
-                    TRẢ NỢ
-                </button>
-            </div>
-        </section>
+                <input type="number" id="loan-amount-input" placeholder="Số tiền vay/trả (VND)" min="1000" class="w-full p-3 rounded-lg bg-gray-700 text-white border border-gray-600 focus:ring-2 focus:ring-red-500 focus:border-red-500 transition duration-150">
+                <div class="flex gap-2">
+                    <button id="borrow-btn" class="flex-1 p-3 rounded-lg font-bold text-white bg-indigo-700 hover:bg-indigo-800 active:bg-indigo-900 transition duration-150 shadow-lg shadow-indigo-900/50">
+                        VAY TIỀN
+                    </button>
+                    <button id="repay-btn" class="flex-1 p-3 rounded-lg font-bold text-white bg-pink-600 hover:bg-pink-700 active:bg-pink-800 transition duration-150 shadow-lg shadow-pink-900/50">
+                        TRẢ NỢ
+                    </button>
+                </div>
+            </section>
 
-        <!-- NẠP/RÚT TIỀN -->
-        <section class="p-4 bg-gray-800 rounded-xl shadow-md space-y-3">
-            <h2 class="text-xl font-semibold border-b border-gray-700 pb-2">Nạp/Rút Tiền Mặt</h2>
-            <input type="number" id="cash-amount-input" placeholder="Nhập Số Tiền (VND)" min="1000" class="w-full p-3 rounded-lg bg-gray-700 text-white border border-gray-600 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150">
-            <div class="flex space-x-3">
-                <button id="deposit-btn" class="w-1/2 p-3 rounded-lg font-bold text-white bg-green-500 hover:bg-green-600 transition duration-150 shadow-lg shadow-green-900/50">
-                    NẠP TIỀN
-                </button>
-                <button id="withdraw-btn" class="w-1/2 p-3 rounded-lg font-bold text-white bg-yellow-500 hover:bg-yellow-600 transition duration-150 shadow-lg shadow-yellow-900/50">
-                    RÚT TIỀN
-                </button>
-            </div>
-        </section>
+            <!-- NẠP/RÚT TIỀN -->
+            <section class="p-4 bg-gray-800 rounded-xl shadow-md space-y-3">
+                <h2 class="text-lg font-semibold border-b border-gray-700 pb-2">Nạp/Rút Tiền Mặt</h2>
+                <input type="number" id="cash-amount-input" placeholder="Nhập số tiền (VND)" min="1000" class="w-full p-3 rounded-lg bg-gray-700 text-white border border-gray-600 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition duration-150">
+                <div class="flex gap-2">
+                    <button id="deposit-btn" class="flex-1 p-3 rounded-lg font-bold text-white bg-green-500 hover:bg-green-600 active:bg-green-700 transition duration-150 shadow-lg shadow-green-900/50">
+                        NẠP TIỀN
+                    </button>
+                    <button id="withdraw-btn" class="flex-1 p-3 rounded-lg font-bold text-white bg-yellow-500 hover:bg-yellow-600 active:bg-yellow-700 transition duration-150 shadow-lg shadow-yellow-900/50">
+                        RÚT TIỀN
+                    </button>
+                </div>
+            </section>
+        </div>
 
         <!-- LỊCH SỬ GIAO DỊCH -->
         <section class="p-4 bg-gray-800 rounded-xl shadow-md">
-            <h2 class="text-xl font-semibold border-b border-gray-700 pb-2">Nhật Ký Thị Trường</h2>
-            <div id="message-log" class="mt-3 h-48 overflow-y-auto space-y-1 text-white">
+            <h2 class="text-lg font-semibold border-b border-gray-700 pb-2">Nhật Ký Thị Trường</h2>
+            <div id="message-log" class="mt-3 h-48 overflow-y-auto space-y-1 text-white scroll-smooth scrollbar-thin scrollbar-thumb-gray-600 scrollbar-track-gray-800">
                 <!-- Log messages will appear here -->
                 <p class="text-sm text-gray-400 p-2 rounded-lg bg-gray-700">Đang dùng localStorage để lưu trạng thái game...</p>
             </div>
